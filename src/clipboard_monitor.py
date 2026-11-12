@@ -1,9 +1,10 @@
 """
 Clipboard monitor — Windows & macOS compatible.
 
-The global hotkey (configured via config.json) TOGGLES translation on / off:
-  • First press  → enable watch mode  (tray icon turns green)
-  • Second press → disable watch mode  (tray icon turns purple)
+Auto-translation starts ENABLED by default.
+
+The global hotkey (configured via config.json) TOGGLES translation on / off
+(tray icon is green when active, purple when inactive).
 
 While watch mode is ON:
   A pynput mouse listener watches for left-button releases.
@@ -13,9 +14,8 @@ While watch mode is ON:
   Every translation is also appended to the log file.
 
 The user workflow:
-  1. Press the hotkey to enable (or use the tray menu toggle).
-  2. Select any text with the mouse — tooltip appears automatically.
-  3. Press the hotkey again to disable.
+    1. Select any text with the mouse — tooltip appears automatically.
+    2. Press the hotkey (or use the tray menu) to toggle ON/OFF.
 
 Platform notes:
   - Windows : pywin32 not required; pynput handles everything.
@@ -48,25 +48,43 @@ _COPY_MOD = Key.cmd if sys.platform == "darwin" else Key.ctrl
 # ---------------------------------------------------------------------------
 # Platform-specific hotkey backend
 #
-# On Windows, pynput.keyboard.GlobalHotKeys creates its own win32 keyboard
-# hook with a message pump that conflicts with pystray's GetMessage loop,
-# causing a crash in pystray._win32._mainloop.  The `keyboard` module handles
-# hotkeys differently (via a low-level keyboard hook in its own thread) and
-# has no conflict with pystray on Windows.
+# We prefer `pynput.keyboard.GlobalHotKeys` for reliability.
 #
-# On macOS, `keyboard` requires root / sudo; pynput.GlobalHotKeys is the
-# correct cross-platform approach there.
+# Historical note: older versions used `pystray` on Windows, and
+# `pynput.GlobalHotKeys` could conflict with pystray's win32 message loop.
+# This project now uses a Qt tray icon, so that conflict no longer applies.
+#
+# We still keep the `keyboard` module as a Windows-only fallback because it
+# is cheap and works well in some environments.
 # ---------------------------------------------------------------------------
 if sys.platform == "win32":
-    import keyboard as _keyboard_win  # type: ignore[import]
-    _HOTKEY_BACKEND = "keyboard"
-    _GlobalHotKeys = None  # type: ignore[assignment]
+    from pynput.keyboard import GlobalHotKeys as _GlobalHotKeys
+    _HOTKEY_BACKEND = "pynput"
+
+    # Not used on Windows; defined for type-checkers.
+    _MacOSHotkey = None  # type: ignore[assignment]
+
+    try:
+        import keyboard as _keyboard_win  # type: ignore[import]
+    except Exception:  # noqa: BLE001
+        _keyboard_win = None  # type: ignore[assignment]
 
     import ctypes as _ctypes
     _k32 = _ctypes.windll.kernel32
+elif sys.platform == "darwin":
+    # macOS: try PyObjC first, fall back to pynput
+    try:
+        from src.macos_hotkey import MacOSHotkey as _MacOSHotkey
+        _HOTKEY_BACKEND = "pyobjc"
+        _GlobalHotKeys = None  # type: ignore[assignment]
+    except (ImportError, ValueError):
+        from pynput.keyboard import GlobalHotKeys as _GlobalHotKeys
+        _HOTKEY_BACKEND = "pynput"
+        _MacOSHotkey = None  # type: ignore[assignment]
 else:
     from pynput.keyboard import GlobalHotKeys as _GlobalHotKeys
     _HOTKEY_BACKEND = "pynput"
+    _MacOSHotkey = None  # type: ignore[assignment]
 
 _SPECIAL_KEYS = {
     "ctrl", "alt", "shift", "cmd", "win", "super",
@@ -75,6 +93,40 @@ _SPECIAL_KEYS = {
     "home", "end", "pageup", "pagedown", "up", "down", "left", "right",
 }
 _FKEY_RE = re.compile(r"^f\d+$")
+
+# ---------------------------------------------------------------------------
+# Selection heuristics
+#
+# The app triggers translation by synthesizing Ctrl/Cmd+C on mouse release.
+# Some apps/websites can change the clipboard on a simple click (e.g. copying
+# a link URL or focused element), which can cause false translations.
+#
+# We therefore only attempt capture when the user likely selected text:
+#   - drag selection (mouse moved between press and release), OR
+#   - double/triple click selection (word/paragraph).
+#
+# Additionally, we ignore URL-shaped clipboard contents.
+# ---------------------------------------------------------------------------
+_DRAG_MIN_DISTANCE_PX = 6
+_MULTI_CLICK_MAX_INTERVAL_S = 0.45
+_MULTI_CLICK_MAX_MOVE_PX = 10
+_URL_RE = re.compile(r"^(?:https?://|www\.)\S+$", flags=re.IGNORECASE)
+
+
+def _dist_px(a: tuple[int, int], b: tuple[int, int]) -> float:
+    dx = float(a[0] - b[0])
+    dy = float(a[1] - b[1])
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _looks_like_url(text: str) -> bool:
+    s = (text or "").strip()
+    if not s:
+        return False
+    # Multi-line selections are almost certainly not a URL.
+    if "\n" in s or "\r" in s:
+        return False
+    return bool(_URL_RE.match(s))
 
 
 def _normalize_lang(lang: str | None) -> str:
@@ -193,6 +245,9 @@ class ClipboardMonitor:
         self._hotkey_listener = None   # GlobalHotKeys (macOS/Linux) or thread (Windows)
         self._hotkey_str: str = ""
         self._hotkey_handle = None     # keyboard.add_hotkey handle (Windows only)
+        self._delete_hotkey_listener = None
+        self._delete_hotkey_handle = None
+        self._delete_hotkey_str: str = ""
         self._hotkey_watchdog_stop = threading.Event()
         self._hotkey_watchdog_thread: threading.Thread | None = None
         self._last_hotkey_ts = 0.0
@@ -201,6 +256,14 @@ class ClipboardMonitor:
         self._translate_lock = threading.Lock()
         self._pending_text: str | None = None
         self._pending_lock = threading.Lock()
+
+        # Mouse-selection heuristics
+        self._left_press_pos: tuple[int, int] | None = None
+        self._left_press_ts: float = 0.0
+        self._last_left_release_pos: tuple[int, int] | None = None
+        self._last_left_release_ts: float = 0.0
+        self._left_click_count: int = 0
+        self._multi_click_token: int = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -218,20 +281,23 @@ class ClipboardMonitor:
         """The configured hotkey string (e.g. 'ctrl+alt+z')."""
         return str(self._cfg.get("hotkey", "ctrl+alt+t"))
 
-    def start(self) -> None:
-        """Register the global hotkey (watch mode starts OFF)."""
+    def start(self, start_active: bool = True) -> None:
+        """Register the global hotkey and (optionally) enable watch mode."""
         if self._running:
             return
 
         self._running = True
         self._hotkey_watchdog_stop.clear()
         self._register_hotkey(force=True)
-        if _HOTKEY_BACKEND == "keyboard":
+        if sys.platform == "win32":
             self._start_hotkey_watchdog()
 
         if self._hotkey_str:
             print(f"[monitor] Hotkey '{self._hotkey_str}' registered — toggles translation on/off.")
-        # Watch mode starts OFF; user enables via hotkey or tray menu.
+
+        # Default behavior: start with auto-translation enabled.
+        if start_active and not self._active:
+            self.toggle(source="startup")
 
     def stop(self) -> None:
         """Disable watch mode and clean up all listeners."""
@@ -240,16 +306,29 @@ class ClipboardMonitor:
         self._hotkey_watchdog_stop.set()
         if _HOTKEY_BACKEND == "keyboard":
             try:
-                if self._hotkey_handle is not None:
+                if _keyboard_win is not None and self._hotkey_handle is not None:
                     try:
                         _keyboard_win.remove_hotkey(self._hotkey_handle)
                     except Exception:
                         pass
                 self._hotkey_handle = None
+                if _keyboard_win is not None and self._delete_hotkey_handle is not None:
+                    try:
+                        _keyboard_win.remove_hotkey(self._delete_hotkey_handle)
+                    except Exception:
+                        pass
+                self._delete_hotkey_handle = None
                 self._hotkey_str = ""
-                _keyboard_win.unhook_all_hotkeys()
+                self._delete_hotkey_str = ""
+                if _keyboard_win is not None:
+                    _keyboard_win.unhook_all_hotkeys()
             except Exception:
                 pass
+        elif _HOTKEY_BACKEND == "pyobjc":
+            self._stop_hotkey_listener()
+            if self._delete_hotkey_listener:
+                self._delete_hotkey_listener.stop()
+                self._delete_hotkey_listener = None
         else:
             self._stop_hotkey_listener()
         self._stop_mouse_listener()
@@ -262,7 +341,14 @@ class ClipboardMonitor:
                 self._last_text = pyperclip.paste() or ""
             except Exception:
                 self._last_text = ""
-            self._start_mouse_listener()
+            try:
+                self._start_mouse_listener()
+            except Exception as exc:  # noqa: BLE001
+                # On macOS, starting global input listeners can fail when
+                # Accessibility/Input Monitoring permission is missing.
+                # Never let that crash the app.
+                self._active = False
+                print(f"[monitor] Failed to start mouse listener: {exc}", flush=True)
             if source == "hotkey":
                 print("[monitor] (hotkey) Auto-translation ENABLED.", flush=True)
         else:
@@ -270,7 +356,11 @@ class ClipboardMonitor:
             if source == "hotkey":
                 print("[monitor] (hotkey) Auto-translation DISABLED.", flush=True)
         if self._on_toggle_callback:
-            self._on_toggle_callback(self._active)
+            # Backwards compatible: callback may accept (active) or (active, source)
+            try:
+                self._on_toggle_callback(self._active, source)
+            except TypeError:
+                self._on_toggle_callback(self._active)
         return self._active
 
     def reload_config(self) -> None:
@@ -278,10 +368,8 @@ class ClipboardMonitor:
         was_active = self._active
         self.stop()
         self._cfg = cfg_mod.load()
-        self.start()          # sets self._running = True internally
         # Preserve previous watch-mode state after reload.
-        if was_active:
-            self.toggle(source="reload")
+        self.start(start_active=was_active)  # sets self._running = True internally
         print(f"[monitor] Config reloaded. targets={self._cfg.get('target_languages')}")
 
     # ------------------------------------------------------------------
@@ -299,19 +387,49 @@ class ClipboardMonitor:
         # Run synchronously so the console status prints immediately.
         self.toggle(source="hotkey")
 
+    def _on_delete_log_hotkey(self) -> None:
+        """Remove the most recent persisted translation when requested."""
+        now = time.monotonic()
+        if now < self._suppress_hotkey_until:
+            return
+        self._suppress_hotkey_until = now + 0.5
+
+        log_cfg = self._cfg.get("log_file", "log/translations.log")
+        if not log_cfg:
+            print("[monitor] Log deletion skipped because logging is disabled.", flush=True)
+            return
+
+        if getattr(sys, "frozen", False):
+            base_dir = os.path.dirname(sys.executable)
+        else:
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        log_path = log_cfg if os.path.isabs(log_cfg) else os.path.join(base_dir, log_cfg)
+
+        if translation_log.remove_last_entry(log_path):
+            print(f"[monitor] Removed last translation log entry: {log_path}", flush=True)
+        else:
+            print("[monitor] No translation log entry to remove.", flush=True)
+
     def _register_hotkey(self, force: bool = False) -> None:
         """(Re)register the hotkey for the current config.
 
-        On Windows we use the `keyboard` backend which can occasionally stop
-        receiving events after sleep/lock cycles. Re-registering is a cheap and
-        effective recovery.
+        On Windows, the hotkey backend can occasionally stop receiving events
+        after sleep/lock cycles. Re-registering is a cheap and effective
+        recovery.
         """
+        global _HOTKEY_BACKEND  # noqa: PLW0603
         hotkey = self._cfg.get("hotkey", "ctrl+alt+t")
+        delete_hotkey = self._cfg.get("delete_last_log_hotkey", "ctrl+alt+backspace")
 
-        if not force and hotkey == self._hotkey_str:
+        if not force and hotkey == self._hotkey_str and delete_hotkey == self._delete_hotkey_str:
             return
 
         if _HOTKEY_BACKEND == "keyboard":
+            if _keyboard_win is None:
+                self._hotkey_handle = None
+                self._hotkey_str = ""
+                print("[monitor] Windows hotkey backend 'keyboard' is unavailable (missing dependency).", flush=True)
+                return
             # Remove the previous handler first to avoid duplicate toggles.
             if self._hotkey_handle is not None:
                 try:
@@ -319,6 +437,12 @@ class ClipboardMonitor:
                 except Exception:
                     pass
                 self._hotkey_handle = None
+            if self._delete_hotkey_handle is not None:
+                try:
+                    _keyboard_win.remove_hotkey(self._delete_hotkey_handle)
+                except Exception:
+                    pass
+                self._delete_hotkey_handle = None
 
             try:
                 self._hotkey_handle = _keyboard_win.add_hotkey(
@@ -327,7 +451,14 @@ class ClipboardMonitor:
                     suppress=False,
                     trigger_on_release=False,
                 )
+                self._delete_hotkey_handle = _keyboard_win.add_hotkey(
+                    delete_hotkey,
+                    self._on_delete_log_hotkey,
+                    suppress=False,
+                    trigger_on_release=False,
+                )
                 self._hotkey_str = hotkey
+                self._delete_hotkey_str = delete_hotkey
                 # Ignore any in-flight key events right after (re)registration.
                 self._suppress_hotkey_until = time.monotonic() + 0.5
             except Exception as exc:  # noqa: BLE001
@@ -335,17 +466,65 @@ class ClipboardMonitor:
                 self._hotkey_str = ""
                 print(f"[monitor] Failed to register hotkey '{hotkey}': {exc}", flush=True)
 
+        elif _HOTKEY_BACKEND == "pyobjc":
+            # macOS via PyObjC AppKit
+            self._stop_hotkey_listener()
+            if self._delete_hotkey_listener:
+                self._delete_hotkey_listener.stop()
+                self._delete_hotkey_listener = None
+            try:
+                self._hotkey_listener = _MacOSHotkey(hotkey, self._on_hotkey)
+                self._hotkey_listener.start()
+                self._delete_hotkey_listener = _MacOSHotkey(delete_hotkey, self._on_delete_log_hotkey)
+                self._delete_hotkey_listener.start()
+                self._hotkey_str = hotkey
+                self._delete_hotkey_str = delete_hotkey
+            except Exception as exc:  # noqa: BLE001
+                self._hotkey_str = ""
+                print(f"[monitor] Failed to register hotkey '{hotkey}' (PyObjC): {exc}", flush=True)
+                # Fall back to pynput if PyObjC fails
+                if _GlobalHotKeys:
+                    try:
+                        pynput_hotkey = _to_pynput_hotkey(hotkey)
+                        delete_pynput_hotkey = _to_pynput_hotkey(delete_hotkey)
+                        self._hotkey_listener = _GlobalHotKeys({
+                            pynput_hotkey: self._on_hotkey,
+                            delete_pynput_hotkey: self._on_delete_log_hotkey,
+                        })
+                        self._hotkey_listener.start()
+                        self._hotkey_str = hotkey
+                        self._delete_hotkey_str = delete_hotkey
+                        print(f"[monitor] Fell back to pynput for hotkey '{hotkey}'", flush=True)
+                    except Exception as exc2:  # noqa: BLE001
+                        print(f"[monitor] Pynput fallback also failed: {exc2}", flush=True)
+
         elif _HOTKEY_BACKEND == "pynput":
-            # macOS/Linux via pynput
+            # cross-platform via pynput
             self._stop_hotkey_listener()
             try:
                 pynput_hotkey = _to_pynput_hotkey(hotkey)
-                self._hotkey_listener = _GlobalHotKeys({pynput_hotkey: self._on_hotkey})
+                delete_pynput_hotkey = _to_pynput_hotkey(delete_hotkey)
+                self._hotkey_listener = _GlobalHotKeys({
+                    pynput_hotkey: self._on_hotkey,
+                    delete_pynput_hotkey: self._on_delete_log_hotkey,
+                })
                 self._hotkey_listener.start()
                 self._hotkey_str = hotkey
+                self._delete_hotkey_str = delete_hotkey
             except Exception as exc:  # noqa: BLE001
                 self._hotkey_str = ""
-                print(f"[monitor] Failed to register hotkey '{hotkey}': {exc}")
+                print(f"[monitor] Failed to register hotkey '{hotkey}' via pynput: {exc}", flush=True)
+
+                # Windows-only: fallback to `keyboard` if available.
+                if sys.platform == "win32" and _keyboard_win is not None:
+                    try:
+                        # Switch backend for the remainder of the process.
+                        _HOTKEY_BACKEND = "keyboard"
+                        self._register_hotkey(force=True)
+                        self._start_hotkey_watchdog()
+                        print(f"[monitor] Fell back to 'keyboard' hotkey backend for '{hotkey}'", flush=True)
+                    except Exception as exc2:  # noqa: BLE001
+                        print(f"[monitor] Windows fallback to 'keyboard' also failed: {exc2}", flush=True)
 
     def _start_hotkey_watchdog(self) -> None:
         if self._hotkey_watchdog_thread and self._hotkey_watchdog_thread.is_alive():
@@ -357,8 +536,7 @@ class ClipboardMonitor:
             while self._running and not self._hotkey_watchdog_stop.wait(interval_s):
                 if not self._running:
                     return
-                if _HOTKEY_BACKEND == "keyboard":
-                    self._register_hotkey(force=True)
+                self._register_hotkey(force=True)
 
         self._hotkey_watchdog_thread = threading.Thread(
             target=_watchdog,
@@ -370,8 +548,13 @@ class ClipboardMonitor:
     def _start_mouse_listener(self) -> None:
         if self._mouse_listener and self._mouse_listener.is_alive():
             return
-        self._mouse_listener = pynput_mouse.Listener(on_click=self._on_mouse_click)
-        self._mouse_listener.start()
+        try:
+            self._mouse_listener = pynput_mouse.Listener(on_click=self._on_mouse_click)
+            self._mouse_listener.start()
+        except Exception as exc:  # noqa: BLE001
+            self._mouse_listener = None
+            print(f"[monitor] Could not start mouse listener: {exc}", flush=True)
+            return
 
     def _stop_mouse_listener(self) -> None:
         if self._mouse_listener:
@@ -393,19 +576,68 @@ class ClipboardMonitor:
         if not self._active:
             return
         if button != pynput_mouse.Button.left or pressed:
+            # Track press position for drag detection.
+            if button == pynput_mouse.Button.left and pressed:
+                self._left_press_pos = (int(x), int(y))
+                self._left_press_ts = time.monotonic()
             return
-        # Capture the release coordinates so the tooltip can be positioned even
-        # if the cursor moves while translation/network calls are in flight.
-        threading.Thread(target=self._capture_selection, args=(int(x), int(y)), daemon=True).start()
+
+        release_pos = (int(x), int(y))
+        now = time.monotonic()
+
+        # Detect drag selection.
+        dragged = False
+        if self._left_press_pos is not None:
+            try:
+                dragged = _dist_px(self._left_press_pos, release_pos) >= _DRAG_MIN_DISTANCE_PX
+            except Exception:
+                dragged = False
+        self._left_press_pos = None
+
+        # Count consecutive clicks for double/triple-click selection.
+        if (
+            self._last_left_release_pos is not None
+            and (now - self._last_left_release_ts) <= _MULTI_CLICK_MAX_INTERVAL_S
+            and _dist_px(self._last_left_release_pos, release_pos) <= _MULTI_CLICK_MAX_MOVE_PX
+        ):
+            self._left_click_count += 1
+        else:
+            self._left_click_count = 1
+        self._last_left_release_pos = release_pos
+        self._last_left_release_ts = now
+
+        # Only capture when it likely represents a text selection.
+        if dragged:
+            # Capture the release coordinates so the tooltip can be positioned even
+            # if the cursor moves while translation/network calls are in flight.
+            threading.Thread(target=self._capture_selection, args=(release_pos[0], release_pos[1]), daemon=True).start()
+            return
+
+        # Double/triple click selection: debounce so a triple-click only triggers once.
+        if self._left_click_count >= 2:
+            self._multi_click_token += 1
+            token = self._multi_click_token
+
+            def _debounced() -> None:
+                # Only run if no newer click arrived.
+                if token != self._multi_click_token:
+                    return
+                # Ensure we are still active and the sequence is still multi-click.
+                if not self._active or self._left_click_count < 2:
+                    return
+                threading.Thread(target=self._capture_selection, args=(release_pos[0], release_pos[1]), daemon=True).start()
+
+            threading.Timer(_MULTI_CLICK_MAX_INTERVAL_S, _debounced).start()
 
     def _capture_selection(self, x: int, y: int) -> None:
-        """Wait briefly, copy selected text, translate if the clipboard changed."""
-        time.sleep(0.18)
+        """Wait briefly, copy selected text, translate and show a tooltip.
 
-        try:
-            before = pyperclip.paste() or ""
-        except Exception:
-            before = ""
+        Note: the clipboard may not change when the user re-selects the same
+        text (the copied value is identical). In that case we still translate
+        and show the tooltip, but we rely on the existing de-dupe logic to
+        avoid re-logging.
+        """
+        time.sleep(0.18)
 
         # We synthesize Ctrl+C/Cmd+C to capture the selection. On Windows, the
         # global hotkey backend can occasionally mis-detect synthetic key events
@@ -420,14 +652,18 @@ class ClipboardMonitor:
         except Exception:
             return
 
-        # If the clipboard didn't change, we likely clicked without selecting
-        # text, or the OS blocked synthetic copy (common on macOS without
-        # Accessibility/Input Monitoring permission). In that case, do nothing.
-        if after == before:
-            return
+        # The clipboard can stay unchanged when the user re-selects the same
+        # text (common) *or* when copy is blocked. Because this method is only
+        # invoked after drag/multi-click heuristics already indicated a likely
+        # selection, we still proceed and rely on downstream de-dupe to avoid
+        # re-logging.
 
         text = after.strip()
         if not text:
+            return
+
+        # Avoid translating URL-only clipboard results (common when clicking links).
+        if _looks_like_url(text):
             return
 
         self._last_text = after
@@ -444,8 +680,8 @@ class ClipboardMonitor:
     def _show_translation(self, text: str, x: int | None = None, y: int | None = None) -> None:
         """Translate *text*, display the tooltip, and append to the log file."""
         if not self._translate_lock.acquire(blocking=False):
-            # A tooltip is currently being shown (Tk mainloop blocks). Queue the
-            # latest selection so it will still be translated/shown afterwards.
+            # A tooltip is currently being shown. Queue the latest selection so
+            # it will still be translated/shown afterwards.
             with self._pending_lock:
                 self._pending_text = text
             return
@@ -522,13 +758,19 @@ class ClipboardMonitor:
                     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                 
                 log_path = log_cfg if os.path.isabs(log_cfg) else os.path.join(base_dir, log_cfg)
+
+                # Also de-dupe against the last N entries already persisted in
+                # the log file (useful across restarts).
+                if translation_log.is_recent_duplicate(text, log_path=log_path, max_entries=10):
+                    should_log = False
                 
-                # Create log directory if it doesn't exist
-                log_dir = os.path.dirname(log_path)
-                if log_dir and not os.path.exists(log_dir):
-                    os.makedirs(log_dir, exist_ok=True)
-                
-                translation_log.log(text, str(source_for_translation), translations, log_path=log_path, examples=examples)
+                if should_log:
+                    # Create log directory if it doesn't exist
+                    log_dir = os.path.dirname(log_path)
+                    if log_dir and not os.path.exists(log_dir):
+                        os.makedirs(log_dir, exist_ok=True)
+
+                    translation_log.log(text, str(source_for_translation), translations, log_path=log_path, examples=examples)
 
             if x is None or y is None:
                 x, y = self._get_cursor_pos()

@@ -4,6 +4,8 @@ A system-tray tool for Windows and macOS that translates selected text on-screen
 
 ## How it works
 
+Auto-translation starts **enabled by default**.
+
 The hotkey (configured via `config.json`, default is `ctrl+shift+t` if not set) acts as a **global toggle**.
 
 - Windows/Linux: use `ctrl+...`
@@ -11,17 +13,18 @@ The hotkey (configured via `config.json`, default is `ctrl+shift+t` if not set) 
 
 | Press | Effect |
 |---|---|
-| 1st press | **Enable** watch mode — tray icon turns green |
-| 2nd press | **Disable** watch mode — tray icon turns purple |
+| Any press | Toggle watch mode ON/OFF (green when ON, purple when OFF) |
+| Delete-log shortcut | Remove the most recent translation from the log file |
 
-While watch mode is **ON**, simply **select any text with the mouse**. The moment you release the mouse button the text is automatically copied, translated, and a floating tooltip appears near your cursor. Every translation is also written to the log file.
+While watch mode is **ON**, simply **select any text with the mouse** (drag to highlight, or double/triple-click to select a word/paragraph). When you finish the selection, the text is automatically copied, translated, and a floating tooltip appears near your cursor. Every translation is also written to the log file.
+
+To reduce accidental triggers (for example when clicking links), URL-only clipboard contents are ignored.
 
 You can also toggle via the tray icon right-click menu.
 
 ### Typical workflow
-1. Press your configured hotkey to turn on translation.
-2. Select any text with the mouse — tooltip appears instantly.
-3. Press the hotkey again when done.
+1. Select any text with the mouse — tooltip appears instantly.
+2. Press your configured hotkey (or use the tray menu) to toggle ON/OFF.
 
 ## Quick start
 
@@ -66,13 +69,24 @@ Grant these to the app you run it from (Terminal / iTerm / VS Code / the package
 
 If permissions are missing, selecting text may not copy to the clipboard, and no tooltip will appear.
 
-## Configuration — `config.json`
+## Configuration
+
+The app loads configuration from an OS-specific file when present:
+
+- Windows: `config.windows.json`
+- macOS: `config.macos.json`
+- Fallback: `config.json`
+
+This lets you keep different hotkeys/targets per OS without editing files when switching machines.
+
+### Keys
 
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `source_language` | string | `"auto"` | Language of selected text. Use `"auto"` for auto-detection, or an ISO 639-1 code (e.g. `"en"`, `"de"`). |
 | `target_languages` | array | `["en","zh-CN"]` | 1–2 language codes to translate into. |
 | `hotkey` | string | `"ctrl+alt+t"` | Global hotkey that toggles watch mode on/off. |
+| `delete_last_log_hotkey` | string | `"ctrl+alt+backspace"` | Global hotkey that removes the most recent translation entry from the log file. |
 | `tooltip_duration_ms` | int | `4000` | Milliseconds the tooltip stays visible. |
 | `max_chars` | int | `500` | Maximum characters of selected text to translate. |
 | `exclusive_source_language` | bool | `false` | If `true` and `source_language` is not `"auto"`, the app checks the detected language. If it doesn't match, it **first tries** translating as `source_language`; if that looks unhelpful it tries `"auto"` and only falls back when `"auto"` produces a more meaningful translation. When it falls back to `"auto"`, the event is **not written to the log**. |
@@ -113,14 +127,16 @@ If permissions are missing, selecting text may not copy to the clipboard, and no
 ```
 launguage_helper/
 ├── main.py                 # Entry point
-├── config.json             # User configuration
+├── config.windows.json     # Windows configuration (preferred on Windows)
+├── config.macos.json       # macOS configuration (preferred on macOS)
+├── config.json             # Fallback configuration
 ├── requirements.txt
 ├── src/
 │   ├── config.py           # Config loader
 │   ├── translator.py       # Translation (Google public endpoint via urllib)
 │   ├── clipboard_monitor.py# Hotkey listener + clipboard handling
-│   ├── tooltip.py          # Floating Tkinter overlay
-│   └── tray.py             # System tray icon (pystray)
+│   ├── tooltip.py          # Floating Qt (PySide6) overlay
+│   └── tray.py             # System tray icon (Qt / PySide6)
 └── .github/
     └── copilot-instructions.md
 ```
@@ -128,7 +144,7 @@ launguage_helper/
 ## Tray icon menu
 
 - **Translation: ON / OFF** — same as pressing the hotkey; toggles watch mode. Icon turns green when active.
-- **Reload Config** — picks up changes to `config.json` without restarting.
+- **Reload Config** — picks up changes to the active config file (OS-specific, falling back to `config.json`) without restarting.
 - **Quit** — stops the app cleanly.
 
 ## Troubleshooting
@@ -137,5 +153,16 @@ launguage_helper/
 |---|---|
 | Tooltip does not appear | Make sure text is actually selected *before* pressing the hotkey. |
 | `ModuleNotFoundError` | Run `pip install -r requirements.txt` inside your virtual environment. |
-| Hotkey conflicts | Change `hotkey` in `config.json` to a combination not used by other apps. |
+| Hotkey conflicts | Change `hotkey` in your active config file (`config.windows.json` / `config.macos.json`, fallback `config.json`) to a combination not used by other apps. |
 | Translation errors | Check your internet connection — Google Translate requires network access. |
+
+
+## generate executable
+Install the requirements in the active virtual environment first, then run:
+
+```powershell
+python -m pip install -r requirements.txt
+python -m PyInstaller --noconfirm --clean --onefile --noconsole --name LanguageHelper --add-data "config.json;." --add-data "config.windows.json;." --add-data "config.macos.json;." main.py
+```
+
+The standalone no-console executable is written to `dist/LanguageHelper.exe`.
